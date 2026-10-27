@@ -241,6 +241,41 @@ func (h *Hub) handleDevicesAPI(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
+func (h *Hub) resolveDeviceID(r *http.Request) string {
+	// 1. Try to extract from Referer header
+	if ref := r.Header.Get("Referer"); ref != "" {
+		if idx := strings.Index(ref, "/proxy/"); idx != -1 {
+			sub := ref[idx+len("/proxy/"):]
+			parts := strings.SplitN(sub, "/", 2)
+			if parts[0] != "" {
+				return parts[0]
+			}
+		}
+	}
+	// 2. Try cookie
+	if c, err := r.Cookie("sysauth_device_id"); err == nil && c.Value != "" {
+		return c.Value
+	}
+	// 3. Fallback: if only one connected device, use it
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if len(h.devices) == 1 {
+		for id := range h.devices {
+			return id
+		}
+	}
+	return ""
+}
+
+func (h *Hub) handleRootLuCIProxy(w http.ResponseWriter, r *http.Request) {
+	deviceID := h.resolveDeviceID(r)
+	if deviceID == "" {
+		http.Error(w, "Target router not found", http.StatusNotFound)
+		return
+	}
+	h.proxyDeviceRequest(deviceID, r.URL.Path, w, r)
+}
+
 func (h *Hub) handleLuCIProxy(w http.ResponseWriter, r *http.Request) {
 	// Route format: /proxy/{device_id}/...
 	trimmed := strings.TrimPrefix(r.URL.Path, "/proxy/")
@@ -250,6 +285,10 @@ func (h *Hub) handleLuCIProxy(w http.ResponseWriter, r *http.Request) {
 	if len(parts) > 1 && parts[1] != "" {
 		subPath = "/" + parts[1]
 	}
+	h.proxyDeviceRequest(deviceID, subPath, w, r)
+}
+
+func (h *Hub) proxyDeviceRequest(deviceID, subPath string, w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		subPath += "?" + r.URL.RawQuery
 	}
@@ -295,12 +334,17 @@ func (h *Hub) handleLuCIProxy(w http.ResponseWriter, r *http.Request) {
 			http.SetCookie(w, &http.Cookie{
 				Name:  "sysauth_http",
 				Value: dev.SessionAuth,
-				Path:  prefix,
+				Path:  "/",
 			})
 			http.SetCookie(w, &http.Cookie{
 				Name:  "sysauth",
 				Value: dev.SessionAuth,
-				Path:  prefix,
+				Path:  "/",
+			})
+			http.SetCookie(w, &http.Cookie{
+				Name:  "sysauth_device_id",
+				Value: deviceID,
+				Path:  "/",
 			})
 		}
 		for k, vals := range resp.Headers {
@@ -308,18 +352,35 @@ func (h *Hub) handleLuCIProxy(w http.ResponseWriter, r *http.Request) {
 				if strings.EqualFold(k, "Location") && strings.HasPrefix(v, "/") {
 					v = prefix + v
 				}
+				if strings.EqualFold(k, "Set-Cookie") && strings.Contains(v, "1970") {
+					continue
+				}
 				w.Header().Add(k, v)
 			}
 		}
 		rawBody, _ := base64.StdEncoding.DecodeString(resp.BodyB64)
 		ct := w.Header().Get("Content-Type")
-		if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/javascript") {
-			rewritten := strings.ReplaceAll(string(rawBody), `"/luci-static/`, `"`+prefix+`/luci-static/`)
-			rewritten = strings.ReplaceAll(rewritten, `"/cgi-bin/luci`, `"`+prefix+`/cgi-bin/luci`)
-			rewritten = strings.ReplaceAll(rewritten, `'/luci-static/`, `'`+prefix+`/luci-static/`)
-			rewritten = strings.ReplaceAll(rewritten, `'/cgi-bin/luci`, `'`+prefix+`/cgi-bin/luci`)
-			rewritten = strings.ReplaceAll(rewritten, `"/ubus"`, `"`+prefix+`/ubus"`)
-			rawBody = []byte(rewritten)
+		if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/javascript") || strings.Contains(ct, "application/json") {
+			bodyStr := string(rawBody)
+
+			// Plain path replacements
+			bodyStr = strings.ReplaceAll(bodyStr, `"/luci-static/`, `"`+prefix+`/luci-static/`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"/cgi-bin/luci`, `"`+prefix+`/cgi-bin/luci`)
+			bodyStr = strings.ReplaceAll(bodyStr, `'/luci-static/`, `'`+prefix+`/luci-static/`)
+			bodyStr = strings.ReplaceAll(bodyStr, `'/cgi-bin/luci`, `'`+prefix+`/cgi-bin/luci`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"/ubus/"`, `"`+prefix+`/ubus/"`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"/ubus"`, `"`+prefix+`/ubus"`)
+			bodyStr = strings.ReplaceAll(bodyStr, `'/ubus/'`, `'`+prefix+`/ubus/'`)
+			bodyStr = strings.ReplaceAll(bodyStr, `'/ubus'`, `'`+prefix+`/ubus'`)
+
+			// JSON-escaped paths used in new LuCI({ ... })
+			escapedPrefix := `\/proxy\/` + deviceID
+			bodyStr = strings.ReplaceAll(bodyStr, `"\/luci-static\/`, `"`+escapedPrefix+`\/luci-static\/`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"\/cgi-bin\/luci`, `"`+escapedPrefix+`\/cgi-bin\/luci`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"\/ubus\/"`, `"`+escapedPrefix+`\/ubus\/"`)
+			bodyStr = strings.ReplaceAll(bodyStr, `"\/ubus"`, `"`+escapedPrefix+`\/ubus"`)
+
+			rawBody = []byte(bodyStr)
 			w.Header().Del("Content-Length")
 		}
 		if resp.Status == 0 {
@@ -428,6 +489,12 @@ func main() {
 	mux.HandleFunc("/api/devices", hub.handleDevicesAPI)
 	mux.HandleFunc("/proxy/", hub.handleLuCIProxy)
 	mux.HandleFunc("/ws/terminal/", hub.handleTerminalWS)
+
+	// Direct routes fallback for LuCI RPC and static assets
+	mux.HandleFunc("/cgi-bin/", hub.handleRootLuCIProxy)
+	mux.HandleFunc("/luci-static/", hub.handleRootLuCIProxy)
+	mux.HandleFunc("/ubus", hub.handleRootLuCIProxy)
+	mux.HandleFunc("/ubus/", hub.handleRootLuCIProxy)
 	subFS, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		pauseAndExit(fmt.Errorf("failed to load embedded static UI: %v", err))

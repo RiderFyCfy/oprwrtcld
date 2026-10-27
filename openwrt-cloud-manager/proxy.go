@@ -46,7 +46,11 @@ func NewTunnelManager(cfg Config, writeJSON func(v interface{}) error) *TunnelMa
 }
 
 func (tm *TunnelManager) HandleHTTPProxy(msg ControlMessage, sysauthToken string) {
-	targetURL := strings.TrimRight(tm.cfg.LocalLuCIAddr, "/") + msg.Path
+	relPath := msg.Path
+	if relPath == "/ubus" || relPath == "/ubus/" {
+		relPath = "/cgi-bin/luci/admin/ubus"
+	}
+	targetURL := strings.TrimRight(tm.cfg.LocalLuCIAddr, "/") + relPath
 	var bodyReader io.Reader
 	if msg.BodyB64 != "" {
 		if raw, err := base64.StdEncoding.DecodeString(msg.BodyB64); err == nil {
@@ -193,9 +197,12 @@ func FetchLocalUbusSession(localLuCIAddr string) string {
 	}
 	token := res.Token
 
-	// 2. Grant luci scope permissions
-	grantArg := fmt.Sprintf(`{"ubus_rpc_session":"%s","scope":"luci","objects":[["*","*"]]}`, token)
-	_ = exec.Command("/bin/ubus", "call", "session", "grant", grantArg).Run()
+	// 2. Grant all required scopes (luci, ubus, uci, file, access-group)
+	scopes := []string{"luci", "ubus", "uci", "file", "access-group"}
+	for _, sc := range scopes {
+		grantArg := fmt.Sprintf(`{"ubus_rpc_session":"%s","scope":"%s","objects":[["*","*"]]}`, token, sc)
+		_ = exec.Command("/bin/ubus", "call", "session", "grant", grantArg).Run()
+	}
 
 	// 3. Set root user and session token for LuCI ucode dispatcher
 	randToken := fmt.Sprintf("%016x%016x", time.Now().UnixNano(), time.Now().UnixNano())
