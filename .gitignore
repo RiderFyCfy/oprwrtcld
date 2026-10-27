@@ -1,0 +1,10 @@
+# Compiled binaries
+*.exe
+*.exe~
+*~
+dist/
+artifacts/
+
+# Go build artifacts
+*.test
+*.prof
