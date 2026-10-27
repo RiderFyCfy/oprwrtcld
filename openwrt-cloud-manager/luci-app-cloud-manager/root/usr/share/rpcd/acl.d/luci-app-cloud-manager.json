@@ -1,0 +1,11 @@
+{
+	"luci-app-cloud-manager": {
+		"description": "Grant UCI access for luci-app-cloud-manager",
+		"read": {
+			"uci": [ "cloud_manager" ]
+		},
+		"write": {
+			"uci": [ "cloud_manager" ]
+		}
+	}
+}

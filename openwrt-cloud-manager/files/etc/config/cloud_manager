@@ -1,0 +1,6 @@
+config cloud_manager 'main'
+	option enabled '1'
+	option server_url 'ws://riderok.mooo.com:8080'
+	option heartbeat_interval '30'
+	option local_luci_addr 'http://127.0.0.1:80'
+	option local_ttyd_addr 'ws://127.0.0.1:7681/ws'
