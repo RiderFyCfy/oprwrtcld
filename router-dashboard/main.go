@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -381,7 +384,43 @@ func (h *Hub) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	_ = cmd.Start()
+}
+
+func pauseAndExit(err error) {
+	fmt.Printf("\n[ERROR] %v\n", err)
+	fmt.Println("\nPress Enter to exit...")
+	_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+	os.Exit(1)
+}
+
 func main() {
+	addr := ":8080"
+	uiURL := "http://localhost:8080"
+
+	// Check if port 8080 is already in use
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Println("============================================================")
+		fmt.Println("  OpenWrt Cloud Manager is ALREADY RUNNING!")
+		fmt.Printf("  Opening %s in your browser...\n", uiURL)
+		fmt.Println("============================================================")
+		openBrowser(uiURL)
+		fmt.Println("\nPress Enter to close this window...")
+		_, _ = bufio.NewReader(os.Stdin).ReadBytes('\n')
+		return
+	}
+
 	hub := NewHub()
 
 	mux := http.NewServeMux()
@@ -391,13 +430,25 @@ func main() {
 	mux.HandleFunc("/ws/terminal/", hub.handleTerminalWS)
 	subFS, err := fs.Sub(staticFS, "static")
 	if err != nil {
-		log.Fatalf("failed to create sub filesystem: %v", err)
+		pauseAndExit(fmt.Errorf("failed to load embedded static UI: %v", err))
 	}
 	mux.Handle("/", http.FileServer(http.FS(subFS)))
 
-	addr := ":8080"
-	log.Printf("[router-dashboard] listening on %s (Controller WS: ws://riderok.mooo.com:8080/ws/device)", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
+	fmt.Println("============================================================")
+	fmt.Println("       OpenWrt Cloud Manager Controller & Dashboard")
+	fmt.Printf("  Web UI:         %s\n", uiURL)
+	fmt.Println("  Controller WS:  ws://riderok.mooo.com:8080/ws/device")
+	fmt.Println("============================================================")
+	fmt.Println("Status: Server is running. Keep this window open!")
+	fmt.Println("Opening dashboard in your default browser...")
+
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		openBrowser(uiURL)
+	}()
+
+	server := &http.Server{Handler: mux}
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		pauseAndExit(err)
 	}
 }
