@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -59,14 +61,19 @@ func (tm *TunnelManager) HandleHTTPProxy(msg ControlMessage, sysauthToken string
 	}
 
 	for k, vals := range msg.Headers {
+		if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Cookie") {
+			continue
+		}
 		for _, v := range vals {
 			req.Header.Add(k, v)
 		}
 	}
+	req.Host = "127.0.0.1"
 
 	if sysauthToken != "" {
 		req.AddCookie(&http.Cookie{Name: "sysauth", Value: sysauthToken})
 		req.AddCookie(&http.Cookie{Name: "sysauth_http", Value: sysauthToken})
+		req.AddCookie(&http.Cookie{Name: "sysauth_https", Value: sysauthToken})
 	}
 
 	resp, err := tm.httpCli.Do(req)
@@ -171,36 +178,29 @@ func (tm *TunnelManager) CloseAll() {
 	}
 }
 
-// FetchLocalUbusSession requests a valid LuCI session token via local uhttpd ubus RPC when available.
+// FetchLocalUbusSession creates an authenticated root session via OpenWrt ubus.
 func FetchLocalUbusSession(localLuCIAddr string) string {
-	rpcBody := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "call",
-		"params": []interface{}{
-			"00000000000000000000000000000000",
-			"session",
-			"create",
-			map[string]interface{}{"timeout": 3600},
-		},
-	}
-	raw, _ := json.Marshal(rpcBody)
-	resp, err := http.Post(strings.TrimRight(localLuCIAddr, "/")+"/ubus", "application/json", bytes.NewReader(raw))
+	// 1. Create session via /bin/ubus
+	out, err := exec.Command("/bin/ubus", "call", "session", "create", `{"timeout":7200}`).Output()
 	if err != nil {
 		return ""
 	}
-	defer resp.Body.Close()
-	var parsed struct {
-		Result []json.RawMessage `json:"result"`
+	var res struct {
+		Token string `json:"ubus_rpc_session"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil || len(parsed.Result) < 2 {
+	if err := json.Unmarshal(out, &res); err != nil || res.Token == "" {
 		return ""
 	}
-	var sessionData struct {
-		UbusRPCSession string `json:"ubus_rpc_session"`
-	}
-	if err := json.Unmarshal(parsed.Result[1], &sessionData); err != nil {
-		return ""
-	}
-	return sessionData.UbusRPCSession
+	token := res.Token
+
+	// 2. Grant luci scope permissions
+	grantArg := fmt.Sprintf(`{"ubus_rpc_session":"%s","scope":"luci","objects":[["*","*"]]}`, token)
+	_ = exec.Command("/bin/ubus", "call", "session", "grant", grantArg).Run()
+
+	// 3. Set root user and session token for LuCI ucode dispatcher
+	randToken := fmt.Sprintf("%016x%016x", time.Now().UnixNano(), time.Now().UnixNano())
+	setArg := fmt.Sprintf(`{"ubus_rpc_session":"%s","values":{"username":"root","token":"%s"}}`, token, randToken)
+	_ = exec.Command("/bin/ubus", "call", "session", "set", setArg).Run()
+
+	return token
 }

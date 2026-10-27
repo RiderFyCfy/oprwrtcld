@@ -288,6 +288,18 @@ func (h *Hub) handleLuCIProxy(w http.ResponseWriter, r *http.Request) {
 	select {
 	case resp := <-ch:
 		prefix := "/proxy/" + deviceID
+		if dev.SessionAuth != "" {
+			http.SetCookie(w, &http.Cookie{
+				Name:  "sysauth_http",
+				Value: dev.SessionAuth,
+				Path:  prefix,
+			})
+			http.SetCookie(w, &http.Cookie{
+				Name:  "sysauth",
+				Value: dev.SessionAuth,
+				Path:  prefix,
+			})
+		}
 		for k, vals := range resp.Headers {
 			for _, v := range vals {
 				if strings.EqualFold(k, "Location") && strings.HasPrefix(v, "/") {
